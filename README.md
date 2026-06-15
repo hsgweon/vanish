@@ -1,0 +1,198 @@
+# Vanish v1.0.0
+
+A high-performance Nextflow pipeline designed to make host DNA contaminants disappear from metagenomic sequencing data. Vanish is species-agnostic, enabling the automated cleanup of reads by filtering out any specified host genome (Human, Mouse, Rat, etc.) while preserving your original file naming conventions.
+
+## Features
+
+* **Host-Agnostic:** Point to any host index (Human, Mouse, Rat, etc.) without modifying the code.
+* **Filename Preservation:** Cleaned reads retain their original input filenames for seamless integration with downstream tools.
+* **Hybrid Library Support:** Automatically detects and processes both **Paired-End** and **Single-End** libraries in the same run.
+* **Sensitive Dehosting:** Employs `bowtie2` in `--very-sensitive` mode for maximum detection of host reads.
+* **High-Performance QC:** Powered by `fastp` optimized with fast-flushing compression (`-z 1`) to eliminate multi-threaded I/O deadlocks on high-core infrastructure ($Q > 25$).
+
+---
+
+## Installation
+
+### 1. Clone the Repository
+
+```bash
+git clone https://github.com/hsgweon/vanish.git
+cd vanish
+
+```
+
+**Prerequisites:**
+* You must have `mamba` (recommended) or `conda` installed. Mamba is significantly faster at solving environments and is available via [Miniforge](https://github.com/conda-forge/miniforge). If you only have `conda`, replace `mamba` with `conda` in the commands below.
+* You must have `git` installed to clone the repository.
+
+### 2. Create the Environment
+
+Use the provided `environment.yml` file to create a self-contained environment with all necessary software. This command also uses `pip` to install the `vanish` scripts.
+
+```bash
+mamba env create -f environment.yml
+```
+
+### 3. Activate the Environment
+
+Activate the newly created environment. You must do this every time you want to use the pipeline.
+
+```bash
+mamba activate vanish-env
+```
+
+---
+
+## Database Preparation
+
+### 1. Human Genome (Pre-built)
+
+If you are dehosting human reads, you can download the pre-built GRCh38 index:
+
+```bash
+mkdir -p human_index
+wget https://ftp.ncbi.nlm.nih.gov/genomes/all/GCA/000/001/405/GCA_000001405.15_GRCh38/seqs_for_alignment_pipelines.ucsc_ids/GCA_000001405.15_GRCh38_full_analysis_set.fna.bowtie_index.tar.gz
+tar -xvf *.tar.gz -C human_index
+
+```
+
+### 2. Custom Host Databases (Example: Rat)
+
+Vanish is host-agnostic. To remove DNA from a different species, you must download the FASTA and build a Bowtie2 index.
+
+**Example: Building a Rat (*Rattus norvegicus*) index**
+
+1. **Download the FASTA:**
+```bash
+mkdir -p rat_index
+wget -P rat_index/ https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/015/227/675/GCF_015227675.2_mRatBN7.2/GCF_015227675.2_mRatBN7.2_genomic.fna.gz
+gunzip rat_index/*.gz
+
+```
+
+2. **Build the Index:**
+
+```bash
+# Usage: bowtie2-build <reference_fasta> <index_base_name>
+bowtie2-build --threads 16 rat_index/GCF_015227675.2_mRatBN7.2_genomic.fna rat_index/rat_mRatBN7
+```
+
+---
+
+## Quick Start (Test Data)
+
+Vanish comes with a tiny dataset and a preparation script so you can instantly verify your installation. Assuming you have downloaded the Human index above, run the following from the root of the cloned repository:
+
+**1. Generate the Read Pairs File:**
+
+The test data uses lowercase `_r1` and `_r2` suffixes, so we tell `vanish-prep` to look for those.
+
+```bash
+vanish-prep --fastq_dir test_data/fastq --r1 "_r1" --r2 "_r2"
+
+```
+
+**2. Run the Pipeline:**
+
+```bash
+vanish --read_pairs read_pairs.csv \
+       --fastq_dir test_data/fastq \
+       --host_index human_index/GCA_000001405.15_GRCh38_full_analysis_set.fna.bowtie_index \
+       --cpus 4
+
+```
+
+Check the `vanished/` folder to see your properly named, filtered FASTQ files and the generated `vanish_filtering_report.csv`!
+
+---
+
+## Usage
+
+### 1. Prepare your Read Pairs File
+
+**Option A: Automated with `vanish-prep` (Recommended)**
+Vanish includes a helper script that automatically scans your raw data directory, pairs forward and reverse reads, and writes a `read_pairs.csv` file ready for use with `vanish`.
+
+```bash
+# Basic usage: Assumes paired files end in _R1 and _R2
+vanish-prep --fastq_dir ./fastq
+
+# Advanced usage: Specify custom file suffixes and custom output name
+vanish-prep --fastq_dir ./fastq --r1 "_1" --r2 "_2" --out my_samples.csv
+
+```
+
+**Option B: Manual Creation**
+If you prefer to build the tracking CSV manually, format your rows using the structure below. Lines beginning with `#` are automatically filtered out.
+
+```
+# fastq_1,fastq_2
+P01_R1.fastq.gz,P01_R2.fastq.gz
+P02_single.fastq.gz,
+```
+
+### 2. Run the Pipeline
+
+Once your environment is activated, run `vanish` from your working directory.
+
+```bash
+vanish --read_pairs read_pairs.csv \
+       --fastq_dir ./fastq \
+       --host_index /path/to/host_index/base_name \
+       --cpus 16
+
+```
+
+---
+
+## Arguments
+
+| Flag | Description | Default |
+| --- | --- | --- |
+| `--read_pairs` | **Required.** Path to the `read_pairs.csv` file generated by `vanish-prep`. | `null` |
+| `--fastq_dir` | **Required.** Directory containing the raw input FASTQ files. | `null` |
+| `--host_index` | **Required.** Path to the Bowtie2 index prefix for the host genome. | `null` |
+| `--cpus` | Number of CPUs to allocate per task. | `4` |
+| `--outdir` | Target directory to publish final pipeline products. | `vanished` |
+| `-resume` | (Nextflow Native) Resume an interrupted run using cached results from completed steps. | `N/A` |
+
+---
+
+## Output Files
+
+The paths below assume the default `--outdir vanished`.
+
+| File / Directory | Content |
+| --- | --- |
+| `vanished/vanish_filtering_report.csv` | **Run Summary:** A detailed breakdown of raw reads, quality control drops, and host sequences removed per sample. |
+| `vanished/vanished_reads/` | **The Final Product:** Host-free, quality-filtered FASTQ files retaining their exact original names. |
+| `vanished/readqc/` | `fastp` HTML/JSON metrics profiles for sample-by-sample analysis. |
+
+## ⚠️ Post-Run Cleanup (Important)
+
+Nextflow writes all intermediate files to a `work/` directory in your run folder. **This directory can be extremely large** — often many times the size of your input data — as it stores every intermediate file from every task. It is **not** removed automatically.
+
+Once you have verified your results in the `vanished/` output directory, delete it:
+
+```bash
+rm -rf work/
+```
+
+You can also safely remove the Nextflow metadata directory:
+
+```bash
+rm -rf .nextflow/
+```
+
+> **Note:** Deleting `work/` removes Nextflow's checkpoint data. If your run was interrupted and you wish to use `-resume`, do **not** delete `work/` until the run has completed successfully.
+
+---
+
+## License
+
+This project is licensed under the MIT License.
+
+## Contact
+
+For questions or to report issues, please open an issue on the GitHub repository.

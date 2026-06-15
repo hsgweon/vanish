@@ -1,0 +1,198 @@
+#!/usr/bin/env nextflow
+
+nextflow.enable.dsl=2
+
+params.read_pairs = null
+params.fastq_dir   = null
+params.host_index  = null
+params.outdir      = "vanished"
+params.cpus        = 4
+
+def onCompleteAction() {
+    def msg = """\
+        Vanish Pipeline Report
+        ----------------------
+        Status:      ${workflow.success ? 'SUCCESS' : 'FAILED'}
+        Duration:    ${workflow.duration}
+        Output:      ${params.outdir}
+        Nextflow:    ${nextflow.version}
+
+        ${workflow.errorMessage ? "Error Message: ${workflow.errorMessage}" : ""}
+        """.stripIndent()
+
+    if (workflow.success) {
+        println "\033[92m\n--- Vanish Run Complete ---\033[0m"
+    } else {
+        println "\033[91m\n--- Vanish Run Failed ---\033[0m"
+    }
+
+    println msg
+}
+
+process FASTP_QC {
+    tag "${sid}"
+    cpus params.cpus
+    time '8h' // Safety valve: Auto-kill process if it stalls longer than 8 hours
+    publishDir "${params.outdir}/readqc", mode: 'copy', saveAs: { it.replaceFirst(/^qc_/, '') }
+
+    input:
+    tuple val(sid), path(reads)
+
+    output:
+    tuple val(sid), path("qc_*"), emit: qc_reads
+    path "${sid}.fastp.json", emit: json_reports
+    path "${sid}.fastp.html"
+
+    script:
+    def is_paired = reads.size() == 2
+    def out1 = "qc_" + reads[0].getName()
+
+    if (is_paired) {
+        def out2 = "qc_" + reads[1].getName()
+        """
+        fastp --in1 ${reads[0]} --in2 ${reads[1]} \\
+              --out1 ${out1} --out2 ${out2} \\
+              -z 1 \\
+              --json ${sid}.fastp.json --html ${sid}.fastp.html \\
+              --thread ${task.cpus} --detect_adapter_for_pe -q 25 --length_required 100
+        """
+    } else {
+        """
+        fastp --in1 ${reads[0]} \\
+              --out1 ${out1} \\
+              -z 1 \\
+              --json ${sid}.fastp.json --html ${sid}.fastp.html \\
+              --thread ${task.cpus} -q 25 --length_required 100
+        """
+    }
+}
+
+process REMOVE_HOST {
+    tag "${sid}"
+    cpus params.cpus
+    publishDir "${params.outdir}/vanished_reads", mode: 'copy', saveAs: { it.replaceFirst(/^vanish_/, '') }
+
+    input:
+    tuple val(sid), path(reads)
+    path index_dir      // Stages the entire directory into the work dir
+    val index_prefix    // The base name of the index files
+
+    output:
+    tuple val(sid), path("vanish_*"), emit: clean_reads
+    path "${sid}.host_ids.txt", emit: host_ids
+
+    script:
+    def is_paired = reads.size() == 2
+    def out1 = reads[0].getName().replaceFirst(/^qc_/, 'vanish_')
+
+    // Construct the path relative to the staged index_dir
+    def full_index = "${index_dir}/${index_prefix}"
+
+    if (is_paired) {
+        def out2 = reads[1].getName().replaceFirst(/^qc_/, 'vanish_')
+        """
+        bowtie2 -p ${task.cpus} --very-sensitive -x ${full_index} -1 ${reads[0]} -2 ${reads[1]} | \
+        samtools view -F 12 | cut -f1 | sort -u > ${sid}.host_ids.txt
+
+        seqkit grep -v -f ${sid}.host_ids.txt ${reads[0]} | seqkit seq -i -o ${out1}
+        seqkit grep -v -f ${sid}.host_ids.txt ${reads[1]} | seqkit seq -i -o ${out2}
+        """
+    } else {
+        """
+        bowtie2 -p ${task.cpus} --very-sensitive -x ${full_index} -U ${reads[0]} | \
+        samtools view -F 4 | cut -f1 | sort -u > ${sid}.host_ids.txt
+
+        seqkit grep -v -f ${sid}.host_ids.txt ${reads[0]} | seqkit seq -i -o ${out1}
+        """
+    }
+}
+
+process COMPILE_REPORT {
+    publishDir "${params.outdir}", mode: 'copy'
+
+    input:
+    path fastp_jsons
+    path host_ids
+
+    output:
+    path "vanish_filtering_report.csv"
+
+    script:
+    """#!/usr/bin/env python3
+import json, os, csv
+
+samples = []
+for f in os.listdir('.'):
+    if f.endswith('.fastp.json'):
+        sid = f.replace('.fastp.json', '')
+        with open(f) as jf:
+            data = json.load(jf)
+            raw = data['summary']['before_filtering']['total_reads']
+            qc = data['summary']['after_filtering']['total_reads']
+            is_pe = 'read2_before_filtering' in data
+
+        host_file = sid + '.host_ids.txt'
+        host_pairs = 0
+        if os.path.exists(host_file):
+            with open(host_file) as hf:
+                host_pairs = sum(1 for line in hf if line.strip())
+
+        multiplier = 2 if is_pe else 1
+        host_reads_removed = host_pairs * multiplier
+        final_reads = qc - host_reads_removed
+
+        samples.append([sid, "Paired" if is_pe else "Single", raw, qc, raw - qc, host_reads_removed, final_reads])
+
+with open('vanish_filtering_report.csv', 'w', newline='') as out:
+    writer = csv.writer(out)
+    writer.writerow(['#Sample', 'Type', 'Raw_Reads', 'QC_Passed_Reads', 'Low_Quality_Removed', 'Host_Reads_Removed', 'Final_Clean_Reads'])
+    for s in sorted(samples):
+        writer.writerow(s)
+    """
+}
+
+workflow {
+    if (!params.read_pairs || !file(params.read_pairs).exists()) exit 1, "Missing samplesheet: ${params.read_pairs}"
+    if (!params.fastq_dir || !file(params.fastq_dir).isDirectory()) exit 1, "Missing fastq dir: ${params.fastq_dir}"
+
+    if (!params.host_index) exit 1, "Missing bowtie2 index path. Use --host_index <path_to_prefix>"
+
+    // Split the index path into Directory and Prefix for Nextflow staging
+    def idx_file   = file(params.host_index)
+    def idx_dir    = idx_file.getParent()
+    def idx_base   = idx_file.getName()
+
+    // Safety check for index files
+    if (!file("${params.host_index}.1.bt2").exists() && !file("${params.host_index}.1.bt2l").exists()) {
+        exit 1, "Bowtie2 index files not found at: ${params.host_index}. Please check the path and ensure the index has been built."
+    }
+
+    def clean_csv = file(params.read_pairs)
+        .readLines()
+        .findAll { it.trim() && !it.trim().startsWith('#') }
+        .join('\n')
+
+    ch_sample_list = Channel.of(clean_csv)
+        .splitCsv()
+        .map { row ->
+            def f1 = row[0]
+            def f2 = row.size() > 1 ? row[1] : null
+            if (!f1) return null
+            def sid = f1.toString().replaceFirst(/\.(fastq|fq)(\.gz)?$/, '').replaceFirst(/(_R1|_r1|_1)$/, '')
+            def reads = [file("${params.fastq_dir}/${f1}")]
+            if (f2 && f2.trim()) reads << file("${params.fastq_dir}/${f2}")
+            return [ sid, reads ]
+        }
+        .filter { it != null }
+
+    FASTP_QC(ch_sample_list)
+
+    // Pass the index directory as a 'path' and the base as a 'value'
+    REMOVE_HOST(FASTP_QC.out.qc_reads, idx_dir, idx_base)
+
+    COMPILE_REPORT(FASTP_QC.out.json_reports.collect(), REMOVE_HOST.out.host_ids.collect())
+
+    workflow.onComplete {
+        onCompleteAction()
+    }
+}

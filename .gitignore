@@ -1,0 +1,21 @@
+# Nextflow
+.nextflow/
+.nextflow.*
+work/
+
+# Pipeline outputs
+results/
+samplesheet.csv
+
+# Python build artifacts
+build/
+*.egg-info/
+dist/
+
+# Conda/Environment files
+conda/
+*.env
+
+# OS-specific files
+.DS_Store
+Thumbs.db
